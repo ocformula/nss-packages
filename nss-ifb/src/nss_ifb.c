@@ -33,6 +33,11 @@ static void nss_ifb_data_cb(struct net_device *netdev, struct sk_buff *skb, stru
 {
 	struct nss_ifb_dev_private *dp = netdev_priv(netdev);
 
+	if (unlikely(!dp->nss_src_dev)) {
+		dev_kfree_skb_any(skb);
+		return;
+	}
+
 	skb->protocol = eth_type_trans(skb, dp->nss_src_dev);
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 
