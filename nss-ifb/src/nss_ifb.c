@@ -28,12 +28,21 @@ MODULE_PARM_DESC(nss_dev_name, "NSS physical interface source device name");
  * Virtual interface egress packet callback.
  *
  * We send it back to the Linux network stack.
+ *
+ * Packets can still be in flight from the NSS firmware while the interface
+ * is being closed, so the source device is read once and may be NULL.
  */
 static void nss_ifb_data_cb(struct net_device *netdev, struct sk_buff *skb, struct napi_struct *napi)
 {
 	struct nss_ifb_dev_private *dp = netdev_priv(netdev);
+	struct net_device *src_dev = READ_ONCE(dp->nss_src_dev);
 
-	skb->protocol = eth_type_trans(skb, dp->nss_src_dev);
+	if (unlikely(!src_dev)) {
+		dev_kfree_skb_any(skb);
+		return;
+	}
+
+	skb->protocol = eth_type_trans(skb, src_dev);
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 
 	napi_gro_receive(napi, skb);
@@ -131,8 +140,14 @@ static int nss_ifb_close(struct net_device *dev)
 			nss_ctx, src_dev->name);
 	}
 
+	/*
+	 * Packets redirected before the reset may still reach the data
+	 * callback. Clear the source device first and wait for running
+	 * callbacks before dropping the reference.
+	 */
+	WRITE_ONCE(dp->nss_src_dev, NULL);
+	synchronize_net();
 	dev_put(src_dev);
-	dp->nss_src_dev = NULL;
 	dp->nss_src_if_num = -1;
 
 	return 0;
@@ -142,7 +157,7 @@ static int nss_ifb_open(struct net_device *dev)
 {
 	struct nss_ifb_dev_private *dp = netdev_priv(dev);
 	struct net_device *src_dev;
-	uint32_t src_if_num;
+	int32_t src_if_num;
 	uint32_t nh_if_num;
 	nss_tx_status_t nss_tx_status;
 	struct nss_ctx_instance *nss_ctx;
@@ -150,7 +165,7 @@ static int nss_ifb_open(struct net_device *dev)
 	nss_ctx = dp->nssctx->nss_ctx;
 	nh_if_num = dp->nssctx->if_num_n2h;
 
-	strcpy(dp->nss_src_dev_name, nss_dev_name);
+	strscpy(dp->nss_src_dev_name, nss_dev_name, sizeof(dp->nss_src_dev_name));
 
 	src_dev = dev_get_by_name(&init_net, dp->nss_src_dev_name);
 	if (!src_dev) {
@@ -171,6 +186,13 @@ static int nss_ifb_open(struct net_device *dev)
 	pr_info("%p: Net device [%s] has NSS intf_num [%d]\n",
 		nss_ctx, dp->nss_src_dev_name, src_if_num);
 
+	/*
+	 * The source device must be set before the nexthop: from that point
+	 * on, ingress packets of the source device arrive at the data callback.
+	 */
+	dp->nss_src_if_num = src_if_num;
+	WRITE_ONCE(dp->nss_src_dev, src_dev);
+
 	nss_tx_status = nss_phys_if_set_nexthop(nss_ctx, src_if_num, nh_if_num);
 	if (nss_tx_status != NSS_TX_SUCCESS) {
 		pr_warn("%p: Sending message failed, cannot change nexthop for [%s]\n",
@@ -180,9 +202,6 @@ static int nss_ifb_open(struct net_device *dev)
 		pr_info("Nexthop successfully set for [%s] to [%s]\n",
 			dp->nss_src_dev_name, dev->name);
 	}
-
-	dp->nss_src_dev = src_dev;
-	dp->nss_src_if_num = src_if_num;
 
 	return 0;
 }
