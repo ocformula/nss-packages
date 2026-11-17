@@ -1,0 +1,64 @@
+From: ocformula <ocformula@proton.me>
+Subject: [PATCH] ecm_classifier_default: do not delay acceleration of
+ multicast flows
+
+With accel_delay_pkts set to 1 the default classifier denies acceleration
+until it has seen packets in both directions of a connection. A multicast
+flow only ever has one direction, so it is never accelerated.
+
+Skip the acceleration delay for connections whose destination is a
+multicast address. Unicast connections are delayed as before.
+---
+--- a/ecm_classifier_default.c
++++ b/ecm_classifier_default.c
+@@ -290,6 +290,39 @@
+ }
+ 
+ /*
++ * ecm_classifier_default_is_multicast()
++ *	Returns true if the destination of the connection is a multicast address.
++ *
++ * Multicast flows are one-way, so waiting for a reply packet would delay
++ * their acceleration forever.
++ */
++static bool ecm_classifier_default_is_multicast(struct ecm_classifier_default_internal_instance *cdii,
++						struct ecm_tracker_ip_header *ip_hdr)
++{
++	struct ecm_db_connection_instance *ci;
++	ip_addr_t addr;
++
++	if (ip_hdr) {
++		return ecm_ip_addr_is_multicast(ip_hdr->dest_addr);
++	}
++
++	/*
++	 * No packet at hand (e.g. a multicast destination update),
++	 * get the destination address from the connection.
++	 */
++	ci = ecm_db_connection_serial_find_and_ref(cdii->ci_serial);
++	if (!ci) {
++		DEBUG_TRACE("%px: No ci found for %u\n", cdii, cdii->ci_serial);
++		return false;
++	}
++
++	ecm_db_connection_address_get(ci, ECM_DB_OBJ_DIR_TO, addr);
++	ecm_db_connection_deref(ci);
++
++	return ecm_ip_addr_is_multicast(addr);
++}
++
++/*
+  * ecm_classifier_default_process()
+  *	Process the flow for acceleration decision.
+  */
+@@ -412,8 +445,9 @@
+ check_delay:
+ 	/*
+ 	 * Should we delay the acceleration?
++	 * Multicast flows never see a reply, so they are not delayed.
+ 	 */
+-	if (ecm_classifier_accel_delay_pkts) {
++	if (ecm_classifier_accel_delay_pkts && !ecm_classifier_default_is_multicast(cdii, ip_hdr)) {
+ 		if (!ecm_classifier_default_ready_for_accel(cdii, sender)) {
+ 			DEBUG_INFO("%px: connection is not ready for accel\n", cdii);
+ 			spin_lock_bh(&ecm_classifier_default_lock);
